@@ -245,6 +245,51 @@ if [[ $+functions[_zsh_highlight] -eq 0 ]]; then
   unfunction _history-substring-search-function-callable
 fi
 
+fetch_history_from_db() {
+  local search_arg=$(echo "$1" | sed 's/\*/%/g')
+  local current_dir=$PWD
+  local all_parents="places.dir LIKE '$current_dir%'"
+  local priority=1
+  local case_statement="WHEN places.dir LIKE '$current_dir%' THEN $priority"
+
+  while [ "$current_dir" != "/" ]; do
+    current_dir=$(dirname "$current_dir")
+    all_parents="$all_parents OR places.dir LIKE '$current_dir%'"
+    priority=$((priority + 1))
+    case_statement="$case_statement WHEN places.dir LIKE '$current_dir%' THEN $priority"
+  done
+
+  all_parents="$all_parents OR places.dir LIKE '/%'"
+  priority=$((priority + 1))
+  case_statement="$case_statement WHEN places.dir LIKE '/%' THEN $priority"
+
+  # if [ "$debug" = true ]; then
+  #   echo "all_parents: $all_parents" >> /tmp/histdb_query_debug.log
+  #   echo "case_statement: $case_statement" >> /tmp/histdb_query_debug.log
+  # fi
+
+  local escaped_search_arg=$(sql_escape "$search_arg")
+  local query="SELECT history.id FROM history
+    LEFT JOIN commands ON history.command_id = commands.rowid
+    LEFT JOIN places ON history.place_id = places.rowid
+    WHERE ($all_parents)
+    AND commands.argv LIKE '$escaped_search_arg'
+    GROUP BY commands.argv
+    ORDER BY CASE $case_statement END, history.id DESC
+    LIMIT 100"
+
+  # if [ "$debug" = true ]; then
+  #   echo "query: $query" >> /tmp/histdb_query_debug.log
+  # fi
+
+  local result=$(_histdb_query "$query")
+  # if [ "$debug" = true ]; then
+  #   echo "result: $result[@]" >> /tmp/histdb_query_debug.log
+  # fi
+
+  echo "$result"
+}
+
 _history-substring-search-begin() {
   setopt localoptions extendedglob
 
@@ -314,7 +359,11 @@ _history-substring-search-begin() {
     # (R) returns values in reverse older, so the index of the youngest
     # matching history entry is at the head of the list.
     #
-    _history_substring_search_raw_matches=(${(k)history[(R)(#$HISTORY_SUBSTRING_SEARCH_GLOBBING_FLAGS)${search_pattern}]})
+    _history_substring_search_raw_matches=($(fetch_history_from_db "$search_pattern"))
+    if [ "$debug" = true ]; then
+      echo "_history_substring_search_raw_matches: ${_history_substring_search_raw_matches[@]}" >> /tmp/histdb_query_debug.log
+    fi
+
   fi
 
   #
@@ -551,43 +600,14 @@ _history_substring_search_process_raw_matches() {
     local index=${_history_substring_search_raw_matches[$_history_substring_search_raw_match_index]}
 
     #
-    # If HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE is set to a non-empty value,
-    # then ensure that only unique matches are presented to the user.
-    # When HIST_IGNORE_ALL_DUPS is set, ZSH already ensures a unique history,
-    # so in this case we do not need to do anything.
+    # Just append the new history index to the processed matches.
     #
-    if [[ ! -o HIST_IGNORE_ALL_DUPS && -n $HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE ]]; then
-      #
-      # Get the actual history entry at the new index, and check if we have
-      # already added it to _history_substring_search_matches.
-      #
-      local entry=${history[$index]}
+    _history_substring_search_matches+=($index)
 
-      if [[ -z ${_history_substring_search_unique_filter[$entry]} ]]; then
-        #
-        # This is a new unique entry. Add it to the filter and append the
-        # index to _history_substring_search_matches.
-        #
-        _history_substring_search_unique_filter[$entry]=1
-        _history_substring_search_matches+=($index)
-
-        #
-        # Indicate that we did find a match.
-        #
-        return 0
-      fi
-
-    else
-      #
-      # Just append the new history index to the processed matches.
-      #
-      _history_substring_search_matches+=($index)
-
-      #
-      # Indicate that we did find a match.
-      #
-      return 0
-    fi
+    #
+    # Indicate that we did find a match.
+    #
+    return 0
 
   done
 
@@ -655,7 +675,11 @@ _history-substring-search-found() {
   # 2. Use $HISTORY_SUBSTRING_SEARCH_HIGHLIGHT_FOUND
   #    to highlight the current buffer.
   #
-  BUFFER=$history[$_history_substring_search_matches[$_history_substring_search_match_index]]
+  local query="SELECT commands.argv FROM
+        history LEFT JOIN commands ON history.command_id = commands.rowid
+        WHERE history.id=${_history_substring_search_matches[$_history_substring_search_match_index]}"
+  local command=$(_histdb_query "$query")
+  BUFFER="$command"
   _history_substring_search_query_highlight=$HISTORY_SUBSTRING_SEARCH_HIGHLIGHT_FOUND
 }
 
@@ -742,24 +766,6 @@ _history-substring-search-up-search() {
     _history-substring-search-not-found
   fi
 
-  #
-  # When HIST_FIND_NO_DUPS is set, meaning that only unique command lines from
-  # history should be matched, make sure the new and old results are different.
-  #
-  # However, if the HIST_IGNORE_ALL_DUPS shell option, or
-  # HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE is set, then we already have a
-  # unique history, so in this case we do not need to do anything.
-  #
-  if [[ -o HIST_IGNORE_ALL_DUPS || -n $HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE ]]; then
-    return
-  fi
-
-  if [[ -o HIST_FIND_NO_DUPS && $BUFFER == $_history_substring_search_result ]]; then
-    #
-    # Repeat the current search so that a different (unique) match is found.
-    #
-    _history-substring-search-up-search
-  fi
 }
 
 _history-substring-search-down-search() {
@@ -822,24 +828,7 @@ _history-substring-search-down-search() {
     _history-substring-search-not-found
   fi
 
-  #
-  # When HIST_FIND_NO_DUPS is set, meaning that only unique command lines from
-  # history should be matched, make sure the new and old results are different.
-  #
-  # However, if the HIST_IGNORE_ALL_DUPS shell option, or
-  # HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE is set, then we already have a
-  # unique history, so in this case we do not need to do anything.
-  #
-  if [[ -o HIST_IGNORE_ALL_DUPS || -n $HISTORY_SUBSTRING_SEARCH_ENSURE_UNIQUE ]]; then
-    return
-  fi
 
-  if [[ -o HIST_FIND_NO_DUPS && $BUFFER == $_history_substring_search_result ]]; then
-    #
-    # Repeat the current search so that a different (unique) match is found.
-    #
-    _history-substring-search-down-search
-  fi
 }
 
 # -*- mode: zsh; sh-indentation: 2; indent-tabs-mode: nil; sh-basic-offset: 2; -*-
