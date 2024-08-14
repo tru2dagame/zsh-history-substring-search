@@ -269,7 +269,7 @@ fetch_history_from_db() {
   # fi
 
   local escaped_search_arg=$(sql_escape "$search_arg")
-  local query="SELECT history.id FROM history
+  local query="SELECT max(history.id) FROM history
     LEFT JOIN commands ON history.command_id = commands.rowid
     LEFT JOIN places ON history.place_id = places.rowid
     WHERE ($all_parents)
